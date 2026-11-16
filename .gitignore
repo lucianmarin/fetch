@@ -1,0 +1,6 @@
+fetch
+*.ll
+*.o
+*.out
+.pkgs/
+.stricta/

@@ -1,0 +1,302 @@
+from strlib import os
+from strlib import sys
+from semver import parse_semver, semver_satisfies
+from manifest import DepSpec, PackageManifest, parse_dep_rhs, parse_manifest, write_manifest
+from github import default_alias, pkg_store_rel, resolve_repo_version, ensure_cached, materialize_pkg, find_installed_pkg_dir
+
+def print_usage() -> None:
+    print("fetch — Stricta package manager (GitHub-backed, zero registry)")
+    print("Usage:")
+    print("  fetch init [name]")
+    print("  fetch add <owner/repo[@constraint]> [as <alias>]")
+    print("  fetch remove <alias>")
+    print("  fetch install | sync")
+    print("  fetch update [alias]")
+    print("  fetch list")
+    print("  fetch build [entry.str] [-o <output>]")
+
+class QueueItem:
+    dep: DepSpec
+    scope: str
+    ancestors: list[str]
+
+    def __init__(self, dep: DepSpec, scope: str, ancestors: list[str]) -> None:
+        self.dep = dep
+        self.scope = scope
+        self.ancestors = ancestors
+
+    def copy(self) -> QueueItem:
+        return QueueItem(self.dep.copy(), self.scope.copy(), self.ancestors.copy())
+
+class ResolvedEdge:
+    scope: str
+    alias: str
+    repo: str
+    pkg_dir: str
+
+    def __init__(self, scope: str, alias: str, repo: str, pkg_dir: str) -> None:
+        self.scope = scope
+        self.alias = alias
+        self.repo = repo
+        self.pkg_dir = pkg_dir
+
+    def copy(self) -> ResolvedEdge:
+        return ResolvedEdge(self.scope.copy(), self.alias.copy(), self.repo.copy(), self.pkg_dir.copy())
+
+def _has_edge(edges: list[ResolvedEdge], scope: str, alias: str) -> bool:
+    for e in edges:
+        if e.scope == scope and e.alias == alias:
+            return True
+    return False
+
+def _find_edge_by_repo(edges: list[ResolvedEdge], repo: str, cons: str) -> int:
+    for i in range(len(edges)):
+        if edges[i].repo != repo:
+            continue
+        if cons == "" or cons == "*" or cons == "latest":
+            return i
+        # Extract version suffix from pkg_dir
+        pd = edges[i].pkg_dir
+        dash = -1
+        for k in range(len(pd) - 1, -1, -1):
+            if pd[k:k + 1] == "-":
+                dash = k
+                break
+        if dash >= 0:
+            ver = pd[dash + 1:]
+            sv = parse_semver(ver)
+            if sv is not None and semver_satisfies(sv, cons):
+                return i
+            if ver == cons:
+                return i
+    return -1
+
+def _has_ancestor(ancestors: list[str], repo: str) -> bool:
+    for a in ancestors:
+        if a == repo:
+            return True
+    return False
+
+def resolve_and_install(m: PackageManifest, update_target: str, force_update: bool) -> bool:
+    queue: list[QueueItem] = []
+    for d in m.deps:
+        queue.append(QueueItem(d.copy(), ".", []))
+
+    resolved: list[ResolvedEdge] = []
+    materialized_dirs: set[str] = set()
+    q_idx = 0
+    while q_idx < len(queue):
+        item = queue[q_idx].copy()
+        q_idx += 1
+        alias = item.dep.alias.copy()
+        repo = item.dep.repo.copy()
+        cons = item.dep.constraint.copy()
+        scope = item.scope.copy()
+
+        if _has_edge(resolved, scope, alias):
+            continue
+
+        pkg_dir = ""
+        if not force_update and (update_target == "" or update_target != alias):
+            same_idx = _find_edge_by_repo(resolved, repo, cons)
+            if same_idx >= 0:
+                pkg_dir = resolved[same_idx].pkg_dir.copy()
+            else:
+                inst = find_installed_pkg_dir(repo, cons)
+                if inst != "":
+                    pkg_dir = inst
+
+        if pkg_dir == "":
+            tag, sha = resolve_repo_version(repo, cons, True)
+            if sha == "":
+                print(f"error: could not resolve '{repo}' matching '{cons}' on GitHub")
+                return False
+            cdir = ensure_cached(repo, tag, sha)
+            if cdir == "":
+                print(f"error: failed to fetch '{repo}'@{tag} ({sha})")
+                return False
+            sub_m = parse_manifest(f"{cdir}/package.lmon")
+            pkg_dir = pkg_store_rel(repo, tag, sha)
+            if pkg_dir not in materialized_dirs:
+                pkg_dir = materialize_pkg(repo, tag, sha, cdir, sub_m.entry)
+                materialized_dirs.add(pkg_dir.copy())
+            label = alias.copy() if scope == "." else f"{scope}:{alias}"
+            print(f"  + {label} -> .pkgs/{pkg_dir} [{sha[:8]}]")
+
+        resolved.append(ResolvedEdge(scope.copy(), alias.copy(), repo.copy(), pkg_dir.copy()))
+        sub_manifest = parse_manifest(f".pkgs/{pkg_dir}/package.lmon")
+        next_anc = item.ancestors.copy()
+        next_anc.append(repo.copy())
+        for sd in sub_manifest.deps:
+            if not _has_ancestor(next_anc, sd.repo):
+                queue.append(QueueItem(sd.copy(), pkg_dir.copy(), next_anc.copy()))
+
+    return True
+
+def collect_installed_edges(m: PackageManifest) -> list[ResolvedEdge]:
+    queue: list[QueueItem] = []
+    for d in m.deps:
+        queue.append(QueueItem(d.copy(), ".", []))
+    edges: list[ResolvedEdge] = []
+    q_idx = 0
+    while q_idx < len(queue):
+        item = queue[q_idx].copy()
+        q_idx += 1
+        alias = item.dep.alias.copy()
+        repo = item.dep.repo.copy()
+        cons = item.dep.constraint.copy()
+        scope = item.scope.copy()
+        if _has_edge(edges, scope, alias):
+            continue
+        pkg_dir = find_installed_pkg_dir(repo, cons)
+        if pkg_dir == "":
+            continue
+        edges.append(ResolvedEdge(scope.copy(), alias.copy(), repo.copy(), pkg_dir.copy()))
+        sub_m = parse_manifest(f".pkgs/{pkg_dir}/package.lmon")
+        next_anc = item.ancestors.copy()
+        next_anc.append(repo.copy())
+        for sd in sub_m.deps:
+            if not _has_ancestor(next_anc, sd.repo):
+                queue.append(QueueItem(sd.copy(), pkg_dir.copy(), next_anc.copy()))
+    return edges
+
+def cmd_init(args: list[str]) -> int:
+    if os.exists("package.lmon"):
+        print("package.lmon already exists")
+        return 0
+    name = "app"
+    if len(args) >= 3:
+        name = args[2].copy()
+    else:
+        cwd = os.getcwd()
+        parts = cwd.split("/")
+        if len(parts) > 0 and parts[len(parts) - 1] != "":
+            name = parts[len(parts) - 1].copy()
+    m = PackageManifest(name, "0.1.0", "main.str")
+    write_manifest("package.lmon", m)
+    print(f"Created package.lmon for '{m.name}'")
+    return 0
+
+def cmd_add(args: list[str]) -> int:
+    if len(args) < 3:
+        print("Usage: fetch add <owner/repo[@constraint]> [as <alias>]")
+        return 1
+    spec = args[2].copy()
+    repo, cons = parse_dep_rhs(spec)
+    alias = default_alias(repo)
+    if len(args) >= 5 and args[3] == "as":
+        alias = args[4].copy()
+
+    if not os.exists("package.lmon"):
+        m_init = PackageManifest("app", "0.1.0", "main.str")
+        write_manifest("package.lmon", m_init)
+
+    m = parse_manifest("package.lmon")
+    replaced = False
+    for i in range(len(m.deps)):
+        if m.deps[i].alias == alias:
+            m.deps[i].repo = repo.copy()
+            m.deps[i].constraint = cons.copy()
+            replaced = True
+            break
+    if not replaced:
+        m.deps.append(DepSpec(alias.copy(), repo.copy(), cons.copy()))
+
+    if not resolve_and_install(m, alias, False):
+        return 1
+    write_manifest("package.lmon", m)
+    return 0
+
+def cmd_remove(args: list[str]) -> int:
+    if len(args) < 3:
+        print("Usage: fetch remove <alias>")
+        return 1
+    alias = args[2].copy()
+    m = parse_manifest("package.lmon")
+    new_deps: list[DepSpec] = []
+    for d in m.deps:
+        if d.alias != alias:
+            new_deps.append(d.copy())
+    m.deps = new_deps
+    write_manifest("package.lmon", m)
+    os.system("rm -rf .pkgs")
+    resolve_and_install(m, "", False)
+    print(f"Removed '{alias}'")
+    return 0
+
+def cmd_install(force_update: bool, target: str) -> int:
+    if not os.exists("package.lmon"):
+        print("error: package.lmon not found (run 'fetch init' first)")
+        return 1
+    m = parse_manifest("package.lmon")
+    if not resolve_and_install(m, target, force_update):
+        return 1
+    return 0
+
+def cmd_list() -> int:
+    if not os.exists("package.lmon"):
+        print("(no package.lmon)")
+        return 0
+    m = parse_manifest("package.lmon")
+    edges = collect_installed_edges(m)
+    if len(edges) == 0:
+        print("(no packages installed)")
+        return 0
+    for e in edges:
+        lbl = e.alias.copy() if (e.scope == "." or e.scope == "") else f"{e.scope}:{e.alias}"
+        print(f"{lbl}: {e.repo} -> .pkgs/{e.pkg_dir}")
+    return 0
+
+def cmd_build(args: list[str]) -> int:
+    m = parse_manifest("package.lmon")
+    entry = m.entry.copy()
+    out_flag = ""
+    i = 2
+    while i < len(args):
+        if args[i] == "-o" and i + 1 < len(args):
+            out_flag = f"-o '{args[i + 1]}'"
+            i += 2
+        else:
+            entry = args[i].copy()
+            i += 1
+    stricta_bin = os.getenv("STRICTA_BIN")
+    if stricta_bin == "":
+        stricta_bin = "stricta"
+    map_flags: list[str] = []
+    edges = collect_installed_edges(m)
+    for e in edges:
+        if e.pkg_dir == "":
+            continue
+        if e.scope == "." or e.scope == "":
+            map_flags.append(f"-M '{e.alias}=.pkgs/{e.pkg_dir}'")
+        else:
+            map_flags.append(f"-M '.pkgs/{e.scope}:{e.alias}=.pkgs/{e.pkg_dir}'")
+    maps_str = " ".join(map_flags)
+    cmd = f"'{stricta_bin}' '{entry}' -I .pkgs {maps_str} {out_flag}"
+    return os.system(cmd)
+
+def main() -> None:
+    args = sys.argv
+    if len(args) < 2:
+        print_usage()
+        return
+    sub = args[1]
+    if sub == "init":
+        cmd_init(args)
+    elif sub == "add":
+        cmd_add(args)
+    elif sub == "remove" or sub == "rm":
+        cmd_remove(args)
+    elif sub == "install" or sub == "sync":
+        cmd_install(False, "")
+    elif sub == "update":
+        tgt = args[2].copy() if len(args) >= 3 else ""
+        cmd_install(tgt == "", tgt)
+    elif sub == "list" or sub == "ls":
+        cmd_list()
+    elif sub == "build":
+        cmd_build(args)
+    else:
+        print_usage()
+
+main()

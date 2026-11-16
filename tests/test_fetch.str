@@ -1,0 +1,174 @@
+from strlib import os
+from semver import parse_semver, semver_cmp, semver_satisfies, select_tag
+from manifest import DepSpec, PackageManifest, parse_dep_rhs, parse_manifest, write_manifest
+from github import normalize_repo_url, default_alias, pkg_rel_path, pkg_version_label, pkg_store_rel, resolve_repo_version, ensure_cached, materialize_pkg, find_installed_pkg_dir
+
+def test_semver() -> None:
+    v1 = parse_semver("v1.2.3")
+    assert v1 is not None
+    assert v1.major == 1 and v1.minor == 2 and v1.patch == 3
+
+    v2 = parse_semver("1.5")
+    assert v2 is not None
+    assert v2.major == 1 and v2.minor == 5 and v2.patch == 0
+
+    assert semver_cmp(v1, v2) < 0
+    assert semver_satisfies(v1, "^1.2.0")
+    assert not semver_satisfies(v1, "^2.0.0")
+    assert semver_satisfies(v2, "^1.2.0")
+    assert not semver_satisfies(v2, "~1.2.0")
+    assert semver_satisfies(v1, "~1.2.0")
+    assert semver_satisfies(v1, ">=1.2.3")
+    assert not semver_satisfies(v1, ">1.2.3")
+
+    tags: list[tuple[str, str]] = [
+        ("v1.0.0", "aaa111"),
+        ("v1.3.2", "bbb222"),
+        ("v2.0.0", "ccc333"),
+    ]
+    hi = select_tag(tags, "^1.0.0", True)
+    assert hi is not None and hi[0] == "v1.3.2" and hi[1] == "bbb222"
+    lo = select_tag(tags, "^1.0.0", False)
+    assert lo is not None and lo[0] == "v1.0.0" and lo[1] == "aaa111"
+
+def test_manifest() -> None:
+    r1, c1 = parse_dep_rhs("lucianmarin/json@1.2.0")
+    assert r1 == "lucianmarin/json" and c1 == "1.2.0"
+    r2, c2 = parse_dep_rhs("lucianmarin/math")
+    assert r2 == "lucianmarin/math" and c2 == ""
+
+    assert normalize_repo_url("lucianmarin/json") == "https://github.com/lucianmarin/json.git"
+    assert default_alias("lucianmarin/stricta-json") == "stricta-json"
+    assert pkg_rel_path("lucianmarin/stricta-json") == "lucianmarin/stricta-json"
+    assert pkg_rel_path("https://github.com/lucianmarin/strlib.git") == "lucianmarin/strlib"
+    assert pkg_version_label("v1.2.3", "deadbeef12345678") == "1.2.3"
+    assert pkg_version_label("HEAD", "deadbeef12345678") == "deadbeef1234"
+
+    tmp = "/tmp/fetch_unit_test"
+    os.system(f"rm -rf '{tmp}'")
+    os.mkdir_p(tmp)
+    m = PackageManifest("demo", "0.2.0", "app.str")
+    m.deps.append(DepSpec("json", "lucianmarin/json", "1.0.0"))
+    m.deps.append(DepSpec("math", "lucianmarin/math", ""))
+    write_manifest(tmp + "/package.lmon", m)
+    m2 = parse_manifest(tmp + "/package.lmon")
+    assert m2.name == "demo" and m2.version == "0.2.0" and m2.entry == "app.str"
+    assert len(m2.deps) == 2
+    assert m2.deps[0].alias == "json" and m2.deps[0].repo == "lucianmarin/json" and m2.deps[0].constraint == "1.0.0"
+    assert m2.deps[1].alias == "math" and m2.deps[1].repo == "lucianmarin/math" and m2.deps[1].constraint == ""
+    os.system(f"rm -rf '{tmp}'")
+
+def test_e2e_local_git_repos() -> None:
+    root = "/tmp/fetch_e2e_test"
+    os.system(f"rm -rf '{root}'")
+    os.mkdir_p(root + "/repo_b")
+    os.mkdir_p(root + "/repo_a")
+    os.mkdir_p(root + "/app")
+
+    # Create local git repo_b with v1.0.0
+    with open(root + "/repo_b/package.lmon", "w") as fb:
+        fb.write("name: \"pkg_b\"\nversion: \"1.0.0\"\nentry: \"pkg_b.str\"\ndeps: {}\n")
+    with open(root + "/repo_b/pkg_b.str", "w") as fb2:
+        fb2.write("def triple(x: int) -> int:\n    return x * 3\n")
+    rc_b = os.system(f"cd '{root}/repo_b' && git init -q -b main && git config user.email t@t && git config user.name t && git add . && git commit -q -m init && git tag v1.0.0")
+    assert rc_b == 0
+
+    # Create local git repo_a depending on repo_b (strict version 1.0.0), tagged v1.0.0 and v1.2.0
+    with open(root + "/repo_a/package.lmon", "w") as fa:
+        fa.write(f"name: \"pkg_a\"\nversion: \"1.2.0\"\nentry: \"pkg_a.str\"\ndeps:\n    pkg_b: \"{root}/repo_b@1.0.0\"\n")
+    with open(root + "/repo_a/pkg_a.str", "w") as fa2:
+        fa2.write("from pkg_b import triple\ndef compute(x: int) -> int:\n    return triple(x) + 1\n")
+    rc_a = os.system(f"cd '{root}/repo_a' && git init -q -b main && git config user.email t@t && git config user.name t && git add . && git commit -q -m init && git tag v1.0.0 && git tag v1.2.0")
+    assert rc_a == 0
+
+    # Run fetch add (no version = latest -> v1.2.0) + fetch build inside app/
+    fetch_bin = os.getcwd() + "/fetch"
+    stricta_bin = os.getenv("STRICTA_BIN")
+    if stricta_bin == "":
+        stricta_bin = os.getcwd() + "/../stricta/stricta"
+    cache_dir = root + "/cache"
+
+    with open(root + "/app/main.str", "w") as fm:
+        fm.write("import custom_a\nassert custom_a.compute(10) == 31\nprint('E2E_OK')\n")
+
+    rc1 = os.system(f"cd '{root}/app' && STRICTA_CACHE='{cache_dir}' '{fetch_bin}' init myapp >/dev/null")
+    assert rc1 == 0
+    rc2 = os.system(f"cd '{root}/app' && STRICTA_CACHE='{cache_dir}' '{fetch_bin}' add '{root}/repo_a' as custom_a >/dev/null")
+    assert rc2 == 0
+    assert not os.exists(root + "/app/package.lock")
+    ra_dir = root + "/app/.pkgs/" + pkg_rel_path(root + "/repo_a") + "-1.2.0"
+    rb_dir = root + "/app/.pkgs/" + pkg_rel_path(root + "/repo_b") + "-1.0.0"
+    assert os.isdir(ra_dir) and os.exists(ra_dir + "/__init__.str")
+    assert os.isdir(rb_dir) and os.exists(rb_dir + "/__init__.str")
+    assert not os.exists(ra_dir + "/.pkgs")
+    assert not os.exists(root + "/app/.pkgs/custom_a")
+    assert not os.exists(root + "/app/.pkgs/pkg_b")
+
+    rc3 = os.system(f"cd '{root}/app' && STRICTA_BIN='{stricta_bin}' '{fetch_bin}' build main.str -o app_bin >/dev/null")
+    assert rc3 == 0
+    rc4, out4 = os.exec(f"'{root}/app/app_bin'")
+    assert rc4 == 0 and out4.strip() == "E2E_OK"
+
+    # Test remapping two same-named repos via distinct keys in package.lmon deps dict
+    os.mkdir_p(root + "/alice/json")
+    os.mkdir_p(root + "/bob/json")
+    os.mkdir_p(root + "/app2")
+    with open(root + "/alice/json/json.str", "w") as fj1:
+        fj1.write("def tag() -> str:\n    return 'alice'\n")
+    with open(root + "/bob/json/json.str", "w") as fj2:
+        fj2.write("def tag() -> str:\n    return 'bob'\n")
+    assert os.system(f"cd '{root}/alice/json' && git init -q -b main && git config user.email t@t && git config user.name t && git add . && git commit -q -m init") == 0
+    assert os.system(f"cd '{root}/bob/json' && git init -q -b main && git config user.email t@t && git config user.name t && git add . && git commit -q -m init") == 0
+
+    with open(root + "/app2/package.lmon", "w") as fm2:
+        fm2.write(
+            "name: \"app2\"\nversion: \"0.1.0\"\nentry: \"main.str\"\ndeps:\n" +
+            f"    ajson: \"{root}/alice/json\"\n" +
+            f"    bjson: \"{root}/bob/json\"\n"
+        )
+    with open(root + "/app2/main.str", "w") as fm2s:
+        fm2s.write("import ajson\nimport bjson\nassert ajson.tag() == 'alice' and bjson.tag() == 'bob'\nprint('REMAP_OK')\n")
+    assert os.system(f"cd '{root}/app2' && STRICTA_CACHE='{cache_dir}' '{fetch_bin}' install >/dev/null") == 0
+    assert not os.exists(root + "/app2/.pkgs/ajson")
+    assert not os.exists(root + "/app2/.pkgs/bjson")
+    assert os.system(f"cd '{root}/app2' && STRICTA_BIN='{stricta_bin}' '{fetch_bin}' build main.str -o app2_bin >/dev/null") == 0
+    rc5, out5 = os.exec(f"'{root}/app2/app2_bin'")
+    assert rc5 == 0 and out5.strip() == "REMAP_OK"
+
+    # Test single project-local .pkgs/ isolation: app3 uses 'util' -> carol/util, while mod_x uses 'util' -> dave/util
+    os.mkdir_p(root + "/carol/util")
+    os.mkdir_p(root + "/dave/util")
+    os.mkdir_p(root + "/mod_x")
+    os.mkdir_p(root + "/app3")
+    with open(root + "/carol/util/util.str", "w") as fc:
+        fc.write("def val() -> int:\n    return 100\n")
+    with open(root + "/dave/util/util.str", "w") as fd:
+        fd.write("def val() -> int:\n    return 7\n")
+    assert os.system(f"cd '{root}/carol/util' && git init -q -b main && git config user.email t@t && git config user.name t && git add . && git commit -q -m init") == 0
+    assert os.system(f"cd '{root}/dave/util' && git init -q -b main && git config user.email t@t && git config user.name t && git add . && git commit -q -m init") == 0
+
+    with open(root + "/mod_x/package.lmon", "w") as fmx_l:
+        fmx_l.write("name: \"mod_x\"\nversion: \"0.1.0\"\nentry: \"mod_x.str\"\ndeps:\n" + f"    util: \"{root}/dave/util\"\n")
+    with open(root + "/mod_x/mod_x.str", "w") as fmx_s:
+        fmx_s.write("import util\ndef run() -> int:\n    return util.val() + 10\n")
+    assert os.system(f"cd '{root}/mod_x' && git init -q -b main && git config user.email t@t && git config user.name t && git add . && git commit -q -m init") == 0
+
+    with open(root + "/app3/package.lmon", "w") as fa3:
+        fa3.write("name: \"app3\"\nversion: \"0.1.0\"\nentry: \"main.str\"\ndeps:\n" + f"    util: \"{root}/carol/util\"\n" + f"    mod_x: \"{root}/mod_x\"\n")
+    with open(root + "/app3/main.str", "w") as fm3:
+        fm3.write("import util\nimport mod_x\nassert util.val() == 100 and mod_x.run() == 17\nprint('SCOPED_OK')\n")
+    assert os.system(f"cd '{root}/app3' && STRICTA_CACHE='{cache_dir}' '{fetch_bin}' install >/dev/null") == 0
+    assert not os.exists(root + "/app3/package.lock")
+    assert os.system(f"cd '{root}/app3' && STRICTA_BIN='{stricta_bin}' '{fetch_bin}' build main.str -o app3_bin >/dev/null") == 0
+    rc6, out6 = os.exec(f"'{root}/app3/app3_bin'")
+    assert rc6 == 0 and out6.strip() == "SCOPED_OK"
+
+    os.system(f"rm -rf '{root}'")
+
+def main() -> None:
+    test_semver()
+    test_manifest()
+    test_e2e_local_git_repos()
+    print("ALL FETCH TESTS PASSED")
+
+main()

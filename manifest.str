@@ -1,0 +1,76 @@
+from strlib import os
+from strlib import lmon
+
+class DepSpec:
+    alias: str
+    repo: str
+    constraint: str
+
+    def __init__(self, alias: str, repo: str, constraint: str) -> None:
+        self.alias = alias
+        self.repo = repo
+        self.constraint = constraint
+
+    def copy(self) -> DepSpec:
+        return DepSpec(self.alias.copy(), self.repo.copy(), self.constraint.copy())
+
+class PackageManifest:
+    name: str
+    version: str
+    entry: str
+    deps: list[DepSpec]
+
+    def __init__(self, name: str, version: str, entry: str) -> None:
+        self.name = name
+        self.version = version
+        self.entry = entry
+        self.deps = []
+
+def parse_dep_rhs(rhs: str) -> tuple[str, str]:
+    s = rhs.strip()
+    at_idx = s.find("@")
+    if at_idx < 0:
+        return (s, "")
+    repo = s[:at_idx].strip()
+    cons = s[at_idx + 1:].strip()
+    return (repo, cons)
+
+def parse_manifest(path: str) -> PackageManifest:
+    m = PackageManifest("app", "0.1.0", "main.str")
+    if not os.exists(path):
+        return m
+    content = ""
+    with open(path, "r") as f:
+        content = f.read()
+    doc = lmon.loads(content)
+    if not doc.is_object():
+        return m
+    if doc.has("name"):
+        m.name = doc.get_str("name", "app")
+    if doc.has("version"):
+        m.version = doc.get_str("version", "0.1.0")
+    if doc.has("entry"):
+        m.entry = doc.get_str("entry", "main.str")
+    deps_val = doc.get("deps")
+    if deps_val is not None and deps_val.is_object():
+        for i in range(len(deps_val.keys)):
+            alias = deps_val.keys[i].copy()
+            rhs = deps_val.vals[i].as_str("")
+            if rhs != "":
+                repo, cons = parse_dep_rhs(rhs)
+                m.deps.append(DepSpec(alias, repo, cons))
+    return m
+
+def write_manifest(path: str, m: PackageManifest) -> None:
+    doc = lmon.lmon_object()
+    doc.set("name", lmon.lmon_str(m.name.copy()))
+    doc.set("version", lmon.lmon_str(m.version.copy()))
+    doc.set("entry", lmon.lmon_str(m.entry.copy()))
+    deps_obj = lmon.lmon_object()
+    for d in m.deps:
+        rhs = d.repo.copy() if (d.constraint == "*" or d.constraint == "") else f"{d.repo}@{d.constraint}"
+        deps_obj.set(d.alias.copy(), lmon.lmon_str(rhs))
+    doc.set("deps", deps_obj)
+    text = lmon.dumps(doc)
+    with open(path, "w") as f:
+        f.write(text)

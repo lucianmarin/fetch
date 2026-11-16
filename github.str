@@ -1,0 +1,239 @@
+from strlib import os
+from semver import parse_semver, semver_cmp, semver_satisfies, select_tag, SemVer
+
+def normalize_repo_url(repo: str) -> str:
+    r = repo.strip()
+    if r.startswith("https://") or r.startswith("http://") or r.startswith("git@") or r.startswith("file://") or r.startswith("/"):
+        return r
+    if r.startswith("github.com/"):
+        if r.endswith(".git"):
+            return "https://" + r
+        return "https://" + r + ".git"
+    if r.endswith(".git"):
+        return "https://github.com/" + r
+    return "https://github.com/" + r + ".git"
+
+def default_alias(repo: str) -> str:
+    r = repo.strip()
+    if r.endswith("/"):
+        r = r[:len(r) - 1]
+    parts = r.split("/")
+    last = parts[len(parts) - 1].copy()
+    if last.endswith(".git"):
+        last = last[:len(last) - 4]
+    return last
+
+def safe_cache_key(repo: str) -> str:
+    out = repo.replace("://", "__")
+    out = out.replace("/", "__")
+    out = out.replace(":", "_")
+    return out
+
+def cache_base_dir() -> str:
+    env_c = os.getenv("STRICTA_CACHE")
+    if env_c != "":
+        return env_c
+    home = os.getenv("HOME")
+    if home == "":
+        return ".stricta/cache"
+    return home + "/.stricta/cache"
+
+def pkg_rel_path(repo: str) -> str:
+    r = repo.strip()
+    while r.endswith("/"):
+        r = r[:len(r) - 1]
+    if r.endswith(".git"):
+        r = r[:len(r) - 4]
+    if r.startswith("https://github.com/"):
+        r = r[19:]
+    elif r.startswith("http://github.com/"):
+        r = r[18:]
+    elif r.startswith("https://"):
+        r = r[8:]
+    elif r.startswith("http://"):
+        r = r[7:]
+    elif r.startswith("file://"):
+        r = r[7:]
+    elif r.startswith("git@github.com:"):
+        r = r[15:]
+    elif r.startswith("git@"):
+        r = r[4:].replace(":", "/")
+    elif r.startswith("github.com/"):
+        r = r[11:]
+    while r.startswith("/"):
+        r = r[1:]
+    return r.replace(":", "_")
+
+def pkg_version_label(tag: str, sha: str) -> str:
+    t = tag.strip()
+    if t == "" or t == "HEAD":
+        return sha[:12] if len(sha) > 12 else sha.copy()
+    if len(t) >= 2 and (t.startswith("v") or t.startswith("V")):
+        ch = t[1:2]
+        if ch >= "0" and ch <= "9":
+            return t[1:]
+    return t
+
+def pkg_store_rel(repo: str, tag: str, sha: str) -> str:
+    return f"{pkg_rel_path(repo)}-{pkg_version_label(tag, sha)}"
+
+def ls_remote_tags(repo: str) -> list[tuple[str, str]]:
+    url = normalize_repo_url(repo)
+    rc, out = os.exec(f"git ls-remote --tags '{url}' 2>/dev/null")
+    tags: list[tuple[str, str]] = []
+    if rc != 0:
+        return tags
+    tag_shas: dict[str, str] = {}
+    tag_order: list[str] = []
+    for raw_line in out.split("\n"):
+        line = raw_line.strip()
+        if line == "":
+            continue
+        tab = line.find("\t")
+        if tab < 0:
+            continue
+        sha = line[:tab].strip()
+        ref = line[tab + 1:].strip()
+        if not ref.startswith("refs/tags/"):
+            continue
+        tname = ref[10:]
+        peeled = False
+        if tname.endswith("^{}"):
+            tname = tname[:len(tname) - 3]
+            peeled = True
+        if tname not in tag_shas:
+            tag_order.append(tname.copy())
+            tag_shas[tname.copy()] = sha
+        elif peeled:
+            tag_shas[tname.copy()] = sha
+    for tn in tag_order:
+        s = tag_shas[tn].copy()
+        tags.append((tn.copy(), s))
+    return tags
+
+def ls_remote_head(repo: str) -> str:
+    url = normalize_repo_url(repo)
+    rc, out = os.exec(f"git ls-remote '{url}' HEAD 2>/dev/null")
+    if rc != 0:
+        return ""
+    for raw_line in out.split("\n"):
+        line = raw_line.strip()
+        if line == "":
+            continue
+        tab = line.find("\t")
+        if tab > 0:
+            return line[:tab].strip()
+    return ""
+
+def _is_hex_sha(s: str) -> bool:
+    if len(s) < 7 or len(s) > 40:
+        return False
+    for ch in s:
+        o = ord(ch)
+        is_hex = (o >= 48 and o <= 57) or (o >= 97 and o <= 102) or (o >= 65 and o <= 70)
+        if not is_hex:
+            return False
+    return True
+
+def resolve_repo_version(repo: str, constraint: str, pick_highest: bool) -> tuple[str, str]:
+    tags = ls_remote_tags(repo)
+    chosen = select_tag(tags, constraint, pick_highest)
+    if chosen is not None:
+        return chosen
+    c = constraint.strip()
+    if c != "" and c != "*" and c != "latest":
+        for item in tags:
+            if item[0] == c or item[0] == "v" + c:
+                return (item[0].copy(), item[1].copy())
+        if _is_hex_sha(c):
+            return ("HEAD", c)
+        return ("", "")
+    head_sha = ls_remote_head(repo)
+    if head_sha != "":
+        return ("HEAD", head_sha)
+    return ("", "")
+
+def find_installed_pkg_dir(repo: str, constraint: str) -> str:
+    rel = pkg_rel_path(repo)
+    sub_parent = os.dirname(rel)
+    scan_dir = ".pkgs" if (sub_parent == "." or sub_parent == "") else f".pkgs/{sub_parent}"
+    if not os.isdir(scan_dir):
+        return ""
+    base = os.basename(rel)
+    prefix = base + "-"
+    c = constraint.strip()
+    is_any = (c == "" or c == "*" or c == "latest")
+    best_rel = ""
+    best_sv: SemVer | None = None
+    for entry in os.listdir(scan_dir):
+        if not entry.startswith(prefix):
+            continue
+        full_p = f"{scan_dir}/{entry}"
+        if not os.isdir(full_p):
+            continue
+        ver = entry[len(prefix):]
+        if not is_any:
+            sv = parse_semver(ver)
+            if sv is not None and semver_satisfies(sv, c):
+                if best_sv is None or semver_cmp(sv, best_sv) > 0:
+                    best_sv = sv
+                    best_rel = f"{rel}-{ver}"
+            elif ver == c or (len(c) >= 7 and ver.startswith(c)) or (len(ver) >= 7 and c.startswith(ver)):
+                return f"{rel}-{ver}"
+        else:
+            sv = parse_semver(ver)
+            if sv is not None:
+                if best_sv is None or semver_cmp(sv, best_sv) > 0:
+                    best_sv = sv
+                    best_rel = f"{rel}-{ver}"
+            elif best_rel == "":
+                best_rel = f"{rel}-{ver}"
+    return best_rel
+
+def ensure_cached(repo: str, tag: str, sha: str) -> str:
+    cdir = f"{cache_base_dir()}/{safe_cache_key(repo)}/{sha}"
+    if os.isdir(cdir):
+        return cdir
+    parent = f"{cache_base_dir()}/{safe_cache_key(repo)}"
+    os.mkdir_p(parent)
+    url = normalize_repo_url(repo)
+    tmp_dir = cdir + ".tmp"
+    os.system(f"rm -rf '{tmp_dir}'")
+    cloned = False
+    if tag != "" and tag != "HEAD":
+        rc = os.system(f"git clone --quiet --depth 1 --branch '{tag}' '{url}' '{tmp_dir}' 2>/dev/null")
+        if rc == 0:
+            rc2, cur_sha = os.exec(f"git -C '{tmp_dir}' rev-parse HEAD 2>/dev/null")
+            if rc2 == 0 and cur_sha.strip() == sha:
+                cloned = True
+            else:
+                os.system(f"rm -rf '{tmp_dir}'")
+    if not cloned:
+        rc_full = os.system(f"git clone --quiet '{url}' '{tmp_dir}' 2>/dev/null")
+        if rc_full != 0:
+            os.system(f"rm -rf '{tmp_dir}'")
+            return ""
+        rc_co = os.system(f"git -C '{tmp_dir}' checkout --quiet '{sha}' 2>/dev/null")
+        if rc_co != 0:
+            os.system(f"rm -rf '{tmp_dir}'")
+            return ""
+    os.system(f"mv '{tmp_dir}' '{cdir}'")
+    return cdir
+
+def materialize_pkg(repo: str, tag: str, sha: str, cache_dir: str, entry_hint: str) -> str:
+    store_rel = pkg_store_rel(repo, tag, sha)
+    dest = f".pkgs/{store_rel}"
+    os.system(f"rm -rf '{dest}'")
+    os.mkdir_p(dest)
+    for item in os.listdir(cache_dir):
+        if item == ".git" or item == ".pkgs" or item == ".stricta":
+            continue
+        os.system(f"cp -R '{cache_dir}/{item}' '{dest}/'")
+    init_p = f"{dest}/__init__.str"
+    if not os.exists(init_p):
+        repo_label = default_alias(repo)
+        if entry_hint != "" and os.exists(f"{dest}/{entry_hint}"):
+            os.system(f"cp '{dest}/{entry_hint}' '{init_p}'")
+        elif repo_label != "" and os.exists(f"{dest}/{repo_label}.str"):
+            os.system(f"cp '{dest}/{repo_label}.str' '{init_p}'")
+    return store_rel

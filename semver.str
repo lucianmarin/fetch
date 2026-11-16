@@ -1,0 +1,129 @@
+class SemVer:
+    major: int
+    minor: int
+    patch: int
+    raw: str
+
+    def __init__(self, major: int, minor: int, patch: int, raw: str) -> None:
+        self.major = major
+        self.minor = minor
+        self.patch = patch
+        self.raw = raw
+
+    def copy(self) -> SemVer:
+        return SemVer(self.major, self.minor, self.patch, self.raw.copy())
+
+def is_digits(s: str) -> bool:
+    if len(s) == 0:
+        return False
+    for ch in s:
+        o = ord(ch)
+        if o < 48 or o > 57:
+            return False
+    return True
+
+def parse_semver(tag: str) -> SemVer | None:
+    clean = tag.strip()
+    if clean.startswith("v") or clean.startswith("V"):
+        clean = clean[1:]
+    # Strip optional pre-release/build metadata only if clean numeric prefix? Reject pre-releases for stability
+    parts = clean.split(".")
+    if len(parts) < 2 or len(parts) > 3:
+        return None
+    if not is_digits(parts[0]) or not is_digits(parts[1]):
+        return None
+    maj = int(parts[0])
+    minv = int(parts[1])
+    pat = 0
+    if len(parts) == 3:
+        if not is_digits(parts[2]):
+            return None
+        pat = int(parts[2])
+    return SemVer(maj, minv, pat, tag.copy())
+
+def semver_cmp(a: SemVer, b: SemVer) -> int:
+    if a.major != b.major:
+        return -1 if a.major < b.major else 1
+    if a.minor != b.minor:
+        return -1 if a.minor < b.minor else 1
+    if a.patch != b.patch:
+        return -1 if a.patch < b.patch else 1
+    return 0
+
+def semver_satisfies(ver: SemVer, spec: str) -> bool:
+    s = spec.strip()
+    if s == "" or s == "*" or s == "latest":
+        return True
+    if s.startswith("^"):
+        base = parse_semver(s[1:])
+        if base is None:
+            return False
+        if semver_cmp(ver, base) < 0:
+            return False
+        if base.major > 0:
+            return ver.major == base.major
+        if base.minor > 0:
+            return ver.major == 0 and ver.minor == base.minor
+        return ver.major == 0 and ver.minor == 0 and ver.patch == base.patch
+    if s.startswith("~"):
+        base = parse_semver(s[1:])
+        if base is None:
+            return False
+        if semver_cmp(ver, base) < 0:
+            return False
+        return ver.major == base.major and ver.minor == base.minor
+    if s.startswith(">="):
+        base = parse_semver(s[2:])
+        if base is None:
+            return False
+        return semver_cmp(ver, base) >= 0
+    if s.startswith("<="):
+        base = parse_semver(s[2:])
+        if base is None:
+            return False
+        return semver_cmp(ver, base) <= 0
+    if s.startswith(">"):
+        base = parse_semver(s[1:])
+        if base is None:
+            return False
+        return semver_cmp(ver, base) > 0
+    if s.startswith("<"):
+        base = parse_semver(s[1:])
+        if base is None:
+            return False
+        return semver_cmp(ver, base) < 0
+    if s.startswith("="):
+        base = parse_semver(s[1:])
+        if base is None:
+            return False
+        return semver_cmp(ver, base) == 0
+    base = parse_semver(s)
+    if base is None:
+        return False
+    return semver_cmp(ver, base) == 0
+
+def select_tag(tags: list[tuple[str, str]], spec: str, pick_highest: bool) -> tuple[str, str] | None:
+    best_ver: SemVer | None = None
+    best_tag = ""
+    best_sha = ""
+    for item in tags:
+        tag_name = item[0]
+        sha = item[1]
+        sv = parse_semver(tag_name)
+        if sv is None:
+            continue
+        if not semver_satisfies(sv, spec):
+            continue
+        if best_ver is None:
+            best_ver = sv
+            best_tag = tag_name.copy()
+            best_sha = sha.copy()
+        else:
+            c = semver_cmp(sv, best_ver)
+            if (pick_highest and c > 0) or (not pick_highest and c < 0):
+                best_ver = sv
+                best_tag = tag_name.copy()
+                best_sha = sha.copy()
+    if best_ver is None:
+        return None
+    return (best_tag, best_sha)
