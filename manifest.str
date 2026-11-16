@@ -52,13 +52,19 @@ def parse_manifest(path: str) -> PackageManifest:
     if doc.has("entry"):
         m.entry = doc.get_str("entry", "main.str")
     deps_val = doc.get("deps")
-    if deps_val is not None and deps_val.is_object():
+    if deps_val is not None:
+        if not deps_val.is_object():
+            raise f"ValueError: 'deps' in {path} must be an object"
         for i in range(len(deps_val.keys)):
             alias = deps_val.keys[i].copy()
-            rhs = deps_val.vals[i].as_str("")
-            if rhs != "":
-                repo, cons = parse_dep_rhs(rhs)
-                m.deps.append(DepSpec(alias, repo, cons))
+            v = deps_val.vals[i]
+            if not v.is_str():
+                raise f"ValueError: dependency '{alias}' in {path} must be a string"
+            rhs = v.as_str("")
+            repo, cons = parse_dep_rhs(rhs)
+            if repo == "":
+                raise f"ValueError: dependency '{alias}' in {path} has empty repository"
+            m.deps.append(DepSpec(alias, repo, cons))
     return m
 
 def write_manifest(path: str, m: PackageManifest) -> None:

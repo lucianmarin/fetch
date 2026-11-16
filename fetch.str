@@ -211,16 +211,26 @@ def cmd_remove(args: list[str]) -> int:
     if len(args) < 3:
         print("Usage: fetch remove <alias>")
         return 1
+    if not os.exists("package.lmon"):
+        print("error: package.lmon not found")
+        return 1
     alias = args[2].copy()
     m = parse_manifest("package.lmon")
     new_deps: list[DepSpec] = []
+    found = False
     for d in m.deps:
-        if d.alias != alias:
+        if d.alias == alias:
+            found = True
+        else:
             new_deps.append(d.copy())
+    if not found:
+        print(f"error: dependency '{alias}' not found in package.lmon")
+        return 1
     m.deps = new_deps
     write_manifest("package.lmon", m)
     os.system("rm -rf .pkgs")
-    resolve_and_install(m, "", False)
+    if not resolve_and_install(m, "", False):
+        return 1
     print(f"Removed '{alias}'")
     return 0
 
@@ -273,7 +283,8 @@ def cmd_build(args: list[str]) -> int:
             map_flags.append(f"-M '.pkgs/{e.scope}:{e.alias}=.pkgs/{e.pkg_dir}'")
     maps_str = " ".join(map_flags)
     cmd = f"'{stricta_bin}' '{entry}' -I .pkgs {maps_str} {out_flag}"
-    return os.system(cmd)
+    rc = os.system(cmd)
+    return 0 if rc == 0 else 1
 
 def main() -> None:
     args = sys.argv
@@ -281,22 +292,26 @@ def main() -> None:
         print_usage()
         return
     sub = args[1]
+    rc = 0
     if sub == "init":
-        cmd_init(args)
+        rc = cmd_init(args)
     elif sub == "add":
-        cmd_add(args)
+        rc = cmd_add(args)
     elif sub == "remove" or sub == "rm":
-        cmd_remove(args)
+        rc = cmd_remove(args)
     elif sub == "install" or sub == "sync":
-        cmd_install(False, "")
+        rc = cmd_install(False, "")
     elif sub == "update":
         tgt = args[2].copy() if len(args) >= 3 else ""
-        cmd_install(tgt == "", tgt)
+        rc = cmd_install(tgt == "", tgt)
     elif sub == "list" or sub == "ls":
-        cmd_list()
+        rc = cmd_list()
     elif sub == "build":
-        cmd_build(args)
+        rc = cmd_build(args)
     else:
         print_usage()
+        rc = 1
+    if rc != 0:
+        sys.exit(rc)
 
 main()

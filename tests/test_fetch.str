@@ -56,6 +56,14 @@ def test_manifest() -> None:
     assert len(m2.deps) == 2
     assert m2.deps[0].alias == "json" and m2.deps[0].repo == "lucianmarin/json" and m2.deps[0].constraint == "1.0.0"
     assert m2.deps[1].alias == "math" and m2.deps[1].repo == "lucianmarin/math" and m2.deps[1].constraint == ""
+    with open(tmp + "/bad.lmon", "w") as fb:
+        fb.write("name: \"x\"\ndeps:\n    bad: 123\n")
+    bad_m = False
+    try:
+        _ = parse_manifest(tmp + "/bad.lmon")
+    except:
+        bad_m = True
+    assert bad_m
     os.system(f"rm -rf '{tmp}'")
 
 def test_e2e_local_git_repos() -> None:
@@ -108,6 +116,7 @@ def test_e2e_local_git_repos() -> None:
     assert rc3 == 0
     rc4, out4 = os.exec(f"'{root}/app/app_bin'")
     assert rc4 == 0 and out4.strip() == "E2E_OK"
+    assert os.system(f"cd '{root}/app' && '{fetch_bin}' remove nonexistent >/dev/null 2>&1") != 0
 
     # Test remapping two same-named repos via distinct keys in package.lmon deps dict
     os.mkdir_p(root + "/alice/json")
