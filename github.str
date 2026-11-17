@@ -126,10 +126,12 @@ def ls_remote_head(repo: str) -> str:
     return ""
 
 def _is_hex_sha(s: str) -> bool:
-    if len(s) < 7 or len(s) > 40:
+    n = len(s)
+    if n < 7 or n > 40:
         return False
-    for ch in s:
-        o = ord(ch)
+    p = s.bin
+    for i in range(n):
+        o = int(p[i])
         is_hex = (o >= 48 and o <= 57) or (o >= 97 and o <= 102) or (o >= 65 and o <= 70)
         if not is_hex:
             return False

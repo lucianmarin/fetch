@@ -51,13 +51,13 @@ def parse_manifest(path: str) -> PackageManifest:
         m.version = doc.get_str("version", "0.1.0")
     if doc.has("entry"):
         m.entry = doc.get_str("entry", "main.str")
-    deps_val = doc.get("deps")
+    deps_val = doc.get_ref("deps")
     if deps_val is not None:
         if not deps_val.is_object():
             raise f"ValueError: 'deps' in {path} must be an object"
         for i in range(len(deps_val.keys)):
             alias = deps_val.keys[i].copy()
-            v = deps_val.vals[i]
+            v = deps_val.vals[i].ref
             if not v.is_str():
                 raise f"ValueError: dependency '{alias}' in {path} must be a string"
             rhs = v.as_str("")

@@ -57,9 +57,10 @@ def _find_edge_by_repo(edges: list[ResolvedEdge], repo: str, cons: str) -> int:
             return i
         # Extract version suffix from pkg_dir
         pd = edges[i].pkg_dir
+        pb = pd.bin
         dash = -1
         for k in range(len(pd) - 1, -1, -1):
-            if pd[k:k + 1] == "-":
+            if pb[k] == u8(45):
                 dash = k
                 break
         if dash >= 0:

@@ -14,10 +14,12 @@ class SemVer:
         return SemVer(self.major, self.minor, self.patch, self.raw.copy())
 
 def is_digits(s: str) -> bool:
-    if len(s) == 0:
+    n = len(s)
+    if n == 0:
         return False
-    for ch in s:
-        o = ord(ch)
+    p = s.bin
+    for i in range(n):
+        o = int(p[i])
         if o < 48 or o > 57:
             return False
     return True
