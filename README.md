@@ -4,14 +4,28 @@ A minimal, decentralized package manager for the **Stricta** programming languag
 
 ---
 
-## Usage
+## Install
+
+### Homebrew
+
+```bash
+brew install --HEAD lucianmarin/tap/fetch
+```
+
+### From Source
 
 ```bash
 # Build, test, and install fetch (bootstraps stricta + strlib into .pkgs/)
 make
 make test
 make install PREFIX=~/.local
+```
 
+---
+
+## Usage
+
+```bash
 # Initialize a project manifest (package.lmon)
 fetch init myapp
 
